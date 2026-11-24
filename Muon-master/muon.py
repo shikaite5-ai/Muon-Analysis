@@ -13,21 +13,21 @@ def zeropower_via_newtonschulz5(G, steps: int):
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     # 这里近似笔记里的 msign(G)=UV^T：不显式做 SVD，而用多项式迭代改变奇异值、保留左右奇异方向。
-    # ndim>=2 允许前面带 batch 维；最后两维才是每个待正交化的矩阵。
+    # ndim>=2 是要求 G 至少有两个维度，因为这个函数把最后两个维度当成矩阵的行、列。如 G.shape = [8, 4096, 1024]，就是有 8 个 4096x1024 的矩阵。
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
-    # 低精度矩阵乘法省显存/提速；因此这里是数值近似，不是精确 SVD，也不保证奇异值恰好全变成 1。
+    # 每个元素从 32 位浮点数转为 16 位 bfloat16，节省显存和通信带宽；Newton-Schulz 迭代在 bfloat16 下仍然稳定。
     X = G.bfloat16()
-    # 统一让较短边位于列维，后续用 XX^T 做较小维度上的乘法；最后再转回原形状。
+    # 让较短的那个维度成为 X 的行维，这样 X @ X.mT 产生的方阵更小。
     if G.size(-2) > G.size(-1):
         X = X.mT
 
-    # 用 Frobenius 范数缩放到适合迭代的数值范围（注：此处不是精确计算谱范数）。
+    # 用 Frobenius 范数缩放到适合迭代的数值范围（注：此处不是精确计算谱范数）。分母即 |M|_F = sqrt(sum(M_ij^2))，加上 1e-7 避免除零。
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # 五次 Newton–Schulz 多项式：A=XX^T，X <- aX+b(XX^T)X+c(XX^T)^2X。
     # 在 SVD 坐标下，这相当于对各奇异值施加同一个标量多项式，逐步压平强弱差异；
     # 有限步数时只是近似正交化，笔记中的理想 UV^T 是理解目标，不是本函数逐位保证的结果。
-    for _ in range(steps):
+    for _ in range(steps):  # 这里的 A,B,C 是迭代公式的中间变量，等价于笔记里完整的矩阵多项式展开式。
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
@@ -36,24 +36,27 @@ def zeropower_via_newtonschulz5(G, steps: int):
         X = X.mT
     return X
 
-
+# Muon 核心更新函数：输入梯度和历史动量，输出 Muon 更新方向。
 def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
-    # 指数滑动平均动量：momentum <- beta*momentum + (1-beta)*grad。
+    # 更新动量，指数滑动平均动量：momentum <- beta*momentum + (1-beta)*grad，对应笔记里的公式 m_t = beta*m_{t-1} + g_t，这里多了个 (1-beta) 归一化因子。
     momentum.lerp_(grad, 1 - beta)
     # Nesterov 前瞻方向：grad.lerp_(momentum,beta)=(1-beta)*grad+beta*momentum；
     # 关闭时则直接用动量。注意 grad.lerp_ 是原地操作，会改写传入的梯度张量。
+    # 选出本次要处理的更新方向，把当前梯度和刚刚更新好的动量再插值一次：
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     if update.ndim == 4: # for the case of conv filters
-        # 卷积核 [输出通道, 输入通道, 高, 宽] 按输出通道摊为二维矩阵，逐个滤波器组做矩阵更新。
+        # 把四维卷积 [输出通道, 输入通道, 高, 宽] 按输出通道摊平为二维矩阵，好让后面的 Newton–Schulz 方法能按矩阵处理。
         update = update.view(len(update), -1)
-    # 用 Newton–Schulz 将动量/前瞻梯度矩阵近似正交化，近似笔记中的矩阵符号方向。
+    # 用 Newton–Schulz 将动量/前瞻梯度矩阵近似正交化，近似矩阵符号方向。
     update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    # 对长宽比作补偿：让不同矩阵形状的更新尺度更可比；这不是 msign 定义本身。
+    # 对长宽比作补偿：乘一个由矩阵形状决定的缩放系数，让不同矩阵形状的更新尺度更可比；笔记中没有这部分。
     update *= max(1, update.size(-2) / update.size(-1))**0.5
     return update
 
+# ↑ update 的数值由梯度的动量经过 Newton–Schulz 变换得到，可以近似理解为“保留主要奇异方向、让不同方向的强弱更均衡”后的矩阵
 
-class Muon(torch.optim.Optimizer):
+
+class Muon(torch.optim.Optimizer):  # 继承 PyTorch 的通用优化器基类 torch.optim.Optimizer
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
 
@@ -75,9 +78,9 @@ class Muon(torch.optim.Optimizer):
         momentum: The momentum. A value of 0.95 here is usually fine.
     """
     def __init__(self, params, lr=0.02, weight_decay=0, momentum=0.95):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)
-        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)
-        # 按形状排序，便于后续按 rank 分配参数并成批通信。
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum)    # 优化器默认参数
+        assert isinstance(params, list) and len(params) >= 1 and isinstance(params[0], torch.nn.Parameter)  # 检查非空
+        # 按参数形状排序，较大的形状排在前面。这是为了配合后续的分布式参数分配和通信。
         params = sorted(params, key=lambda x: x.size(), reverse=True)
         super().__init__(params, defaults)
 
@@ -89,32 +92,34 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        for group in self.param_groups:
-            params = group["params"]
+        for group in self.param_groups: # 遍历优化器中的每个参数组
+            params = group["params"]    # 取出当前组中的参数列表
             # 分布式版本按 rank 轮转分配矩阵：各 rank 计算自己负责参数的更新，再 all_gather 同步参数。
-            # 补齐列表是为了让各 rank 的 gather 分块等长。
+            # 下面这一行是让分布式通信中 每次参与的参数块数量一致，先给参数列表补上一些占位张量。这样后面的 all_gather 才能有足够的输出位置
             params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
-            for base_i in range(len(params))[::dist.get_world_size()]:
-                if base_i + dist.get_rank() < len(params):
-                    p = params[base_i + dist.get_rank()]
+            for base_i in range(len(params))[::dist.get_world_size()]:  # 以进程总数为步长遍历参数列表，base_i 是当前这一批参数的起始位置
+                if base_i + dist.get_rank() < len(params):  # 确保索引还在真实参数范围内，而不是落到补齐的占位区域
+                    p = params[base_i + dist.get_rank()]    # 取出当前 rank 负责更新的参数 p
                     if p.grad is None:
                         # continue
                         # 该 rank 即使没有梯度也用零梯度占位，使所有 rank 仍按相同顺序参与同步。
                         p.grad = torch.zeros_like(p)  # Force synchronization
-                    state = self.state[p]
-                    if len(state) == 0:
+                    state = self.state[p]   # 取得这个参数对应的优化器状态，包括历史动量等
+                    if len(state) == 0: # 首次调用
                         # 每个参数单独保存其历史动量；首次调用从零开始。
                         state["momentum_buffer"] = torch.zeros_like(p)
+                    # 调用 Muon 核心更新函数
                     update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    # 解耦权重衰减先缩小参数，再沿负 Muon 更新方向走学习率大小的一步。
+                    # 解耦权重衰减先缩小参数
                     p.mul_(1 - group["lr"] * group["weight_decay"])
+                    # 沿负 Muon 更新方向走学习率大小的一步
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])
                 # 收集各 rank 更新后的参数块，确保每个 rank 上的模型副本一致。
                 dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
 
         return loss
 
-
+# 非分布式版本的 Muon 优化器，适合单机单卡训练场景。它的核心更新逻辑与分布式版本一致，只是省去了参数分片和 all_gather 通信。
 class SingleDeviceMuon(torch.optim.Optimizer):
     """
     Muon variant for usage in non-distributed settings.
@@ -158,6 +163,8 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
     return buf1c / (buf2c.sqrt() + eps)
 
 
+# “混合优化器”：同一个优化器里，指定给 Muon 的参数用 Muon 更新，其余参数用 Adam 更新。
+# 通过参数组里的 use_muon=True/False 来选择。
 class MuonWithAuxAdam(torch.optim.Optimizer):
     """
     Distributed Muon variant that can be used for all parameters in the network, since it runs an

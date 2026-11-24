@@ -125,6 +125,7 @@ $$\Delta W=-\eta\operatorname{msign}(G).$$
 
 $$X_0=\frac{M}{\|M\|_F},$$
 
+分母即矩阵的 Frobenius 范数。  
 再重复执行类似下面的更新：
 
 $$X_{k+1}=aX_k+b(X_kX_k^\top)X_k+c(X_kX_k^\top)^2X_k.$$
